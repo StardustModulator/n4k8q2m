@@ -399,7 +399,11 @@ pub(super) fn build(
             let keys = &keys;
             scope.spawn(move || {
                 for shard in slice {
-                    for entry in &mut shard.table {
+                    // Keep only ids named by another id. Absent keys and
+                    // component minima both resolve to themselves, and most
+                    // queries are misses, so a sparse table ends them early.
+                    let mut renamed = Vec::new();
+                    for entry in shard.table.iter() {
                         if entry.key == 0 {
                             continue;
                         }
@@ -407,8 +411,28 @@ pub(super) fn build(
                         let root = roots[node] as usize;
                         let minimum = best[root].load(AtomicOrdering::Relaxed);
                         debug_assert_ne!(minimum, u32::MAX);
-                        entry.value = keys[minimum as usize];
+                        let value = keys[minimum as usize];
+                        if value != entry.key {
+                            renamed.push(Entry { key: entry.key, value });
+                        }
                     }
+                    let (table, mask) = if renamed.is_empty() {
+                        (Vec::new().into_boxed_slice(), 0)
+                    } else {
+                        let capacity = (renamed.len() * 4).next_power_of_two();
+                        let mut table = vec![Entry::default(); capacity].into_boxed_slice();
+                        let mask = capacity - 1;
+                        for e in renamed {
+                            let mut at = hash(e.key) as usize & mask;
+                            while table[at].key != 0 {
+                                at = (at + 1) & mask;
+                            }
+                            table[at] = e;
+                        }
+                        (table, mask)
+                    };
+                    shard.table = table;
+                    shard.mask = mask;
                     shard.base = 0;
                 }
             });
@@ -435,7 +459,7 @@ mod tests {
     fn transitive_components_include_link_only_aliases() {
         let slow = SlowIntern::new();
         let (a, b, c, d) = (key(b"u9"), key(b"u5"), key(b"u1"), key(b"u0"));
-        let aliases = build(vec![vec![(a, b)], vec![(c, d), (b, c)]], &slow, 4);
+        let aliases = build(vec![vec![(a, b)], vec![(c, d), (b, c)]], &slow, 4, 16);
         for linked in [a, b, c, d] {
             assert_eq!(aliases.resolve(linked), d);
         }
@@ -447,7 +471,7 @@ mod tests {
         let upper = key(b"Uzz");
         let lower = key(b"u0");
         let other = key(b"u1");
-        let aliases = build(vec![vec![(lower, other), (other, upper)]], &slow, 3);
+        let aliases = build(vec![vec![(lower, other), (other, upper)]], &slow, 3, 16);
         assert_eq!(aliases.resolve(lower), upper);
         assert_eq!(aliases.resolve(other), upper);
         assert_eq!(aliases.resolve(upper), upper);
@@ -458,11 +482,11 @@ mod tests {
         let slow = SlowIntern::new();
         let cited = key(b"u2");
         let absent = key(b"u3");
-        let aliases = build(vec![vec![(cited, cited)]], &slow, 8);
+        let aliases = build(vec![vec![(cited, cited)]], &slow, 8, 16);
         assert_eq!(aliases.resolve(cited), cited);
         assert_eq!(aliases.resolve(absent), absent);
 
-        let empty = build(Vec::new(), &slow, 0);
+        let empty = build(Vec::new(), &slow, 0, 16);
         assert_eq!(empty.resolve(absent), absent);
     }
 }
