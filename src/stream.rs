@@ -436,5 +436,61 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
             prep.as_millis(),(parsed-prep).as_millis(),(indexed-parsed).as_millis(),(reduced-indexed).as_millis(),
             (grouped-reduced).as_millis(),(total.elapsed()-grouped).as_millis());
     }
+    // The process exits right after writing; unmapping is wasted time.
+    std::mem::forget(maps);
+    std::mem::forget(aliases);
     Ok(Tables{users,camps_out,camps,cat_names,slow,organic})
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    // cargo test --release --bin solve bench_parse -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_parse() {
+        let data = Path::new("/tmp/ss-20m");
+        let w = load_window(&data.join("manifest.json")).unwrap();
+        let origin = w.start_day as i64 * DAY_MS - WEEK_MS;
+        let clock = Clock::new(w.start, w.end);
+        let (prod_cat, unknown, prod_other, _names) = load_products(&data.join("products.csv")).unwrap();
+        let (camp_by_num, _camps, camp_other) = load_campaigns(&data.join("campaigns.csv")).unwrap();
+        let cx = Ctx { prod_cat: &prod_cat, unknown, prod_other: &prod_other, camp_by_num: &camp_by_num,
+                       camp_other: &camp_other, window: &w };
+        let buf = fs::read(data.join("events/part-00043.csv")).unwrap();
+        let body = &buf[memchr::memchr(b'\n', &buf).unwrap() + 1..];
+        let rows_n = memchr::memchr_iter(b'\n', body).count();
+        let shared = Shared { slow: Mutex::new(SlowIntern::new()) };
+        let report = |name: &str, f: &mut dyn FnMut()| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let t = Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!("{name:>12}: {:6.2} ns/row {:6.2} GB/s", best * 1e9 / rows_n as f64, body.len() as f64 / best / 1e9);
+        };
+        report("masks", &mut || {
+            let mut acc = 0u64;
+            let mut at = 0;
+            while body.len() - at >= 64 {
+                let (c, n, q) = unsafe { crate::wire::masks64_for_bench(body.as_ptr().add(at)) };
+                acc = acc.wrapping_add(c ^ n.rotate_left(7) ^ q.rotate_left(13));
+                at += 64;
+            }
+            std::hint::black_box(acc);
+        });
+        report("rows<7>", &mut || {
+            let mut acc = 0usize;
+            wire::rows::<7>(body, |f| acc += f[0].len() + f[6].len());
+            std::hint::black_box(acc);
+        });
+        report("scan_events", &mut || {
+            let mut out = Scan { ev: bins(2048), cl: Vec::new(), links: Vec::new() };
+            scan_events(body, &cx, &clock, &shared, &mut out, origin);
+            std::hint::black_box(&out.ev);
+        });
+        eprintln!("rows={rows_n} bytes={}", body.len());
+    }
 }

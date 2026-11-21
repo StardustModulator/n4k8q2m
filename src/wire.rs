@@ -351,3 +351,8 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) unsafe fn masks64_for_bench(p: *const u8) -> (u64, u64, u64) {
+    unsafe { masks64(p) }
+}

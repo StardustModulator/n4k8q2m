@@ -185,6 +185,8 @@ fn main() {
     let threads=std::env::var("NCPU").ok().and_then(|s|s.parse::<usize>().ok()).filter(|&n|n>0)
         .unwrap_or_else(||thread::available_parallelism().map_or(1,usize::from));
     if let Err(e)=run(Path::new(&input),Path::new(&out),threads){eprintln!("solve: {e}");std::process::exit(1);}
+    // Skip destructors: freeing gigabytes is pure overhead at exit.
+    std::process::exit(0);
 }
 fn run(data:&Path,out:&Path,threads:usize)->Result<(),Box<dyn std::error::Error>>{
     let t=Instant::now();
@@ -194,6 +196,7 @@ fn run(data:&Path,out:&Path,threads:usize)->Result<(),Box<dyn std::error::Error>
     if std::env::var_os("WRITE_CSV").is_some(){write_debug_csv(out,&tables)?;}
     eprintln!("rows user={} camp={} compute_ms={} write_ms={} total_ms={}",tables.users.len(),tables.camps_out.len(),
         (t1-t).as_millis(),t1.elapsed().as_millis(),t.elapsed().as_millis());
+    std::mem::forget(tables);
     Ok(())
 }
 fn write_debug_csv(out:&Path,t:&Tables)->io::Result<()>{
