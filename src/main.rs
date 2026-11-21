@@ -3,6 +3,7 @@
 
 mod id;
 mod parquet;
+mod radix;
 mod time;
 
 use std::cmp::Ordering;
@@ -34,9 +35,10 @@ struct Window {
 
 #[derive(Clone, Copy)]
 struct EventRec {
+    id: u64,
+    user: u64,
     ts: i64,
     ingest: i64,
-    user: u64,
     price: u32,
     cat: u8,
     kind: u8,
@@ -135,20 +137,16 @@ struct Shared {
 }
 
 struct ThreadOut {
-    event_ids: Vec<Vec<u64>>,
-    event_recs: Vec<Vec<EventRec>>,
-    click_ids: Vec<Vec<u64>>,
-    click_recs: Vec<Vec<ClickRec>>,
+    events: Vec<Vec<EventRec>>,
+    clicks: Vec<Vec<ClickRec>>,
     links: Vec<(u64, u64)>,
 }
 
 impl ThreadOut {
     fn new() -> Self {
         Self {
-            event_ids: (0..EVENT_SHARDS).map(|_| Vec::new()).collect(),
-            event_recs: (0..EVENT_SHARDS).map(|_| Vec::new()).collect(),
-            click_ids: (0..CLICK_SHARDS).map(|_| Vec::new()).collect(),
-            click_recs: (0..CLICK_SHARDS).map(|_| Vec::new()).collect(),
+            events: (0..256).map(|_| Vec::new()).collect(),
+            clicks: (0..256).map(|_| Vec::new()).collect(),
             links: Vec::new(),
         }
     }
@@ -293,50 +291,27 @@ fn compute(data: &Path, threads: usize) -> Result<Tables, Box<dyn std::error::Er
     let t_stage = Instant::now();
     let slow = shared.slow.into_inner().unwrap_or_else(|e| e.into_inner());
 
-    let mut event_ids = vec![Vec::new(); EVENT_SHARDS];
-    let mut event_recs = vec![Vec::new(); EVENT_SHARDS];
-    let mut click_ids = vec![Vec::new(); CLICK_SHARDS];
-    let mut click_recs = vec![Vec::new(); CLICK_SHARDS];
+    let mut event_buckets: Vec<Vec<EventRec>> = (0..256).map(|_| Vec::new()).collect();
+    let mut click_buckets: Vec<Vec<ClickRec>> = (0..256).map(|_| Vec::new()).collect();
     let mut links = Vec::new();
     for out in &mut outs {
-        for s in 0..EVENT_SHARDS {
-            event_ids[s].append(&mut out.event_ids[s]);
-            event_recs[s].append(&mut out.event_recs[s]);
+        for (bucket, rows) in out.events.iter_mut().enumerate() {
+            event_buckets[bucket].append(rows);
         }
-        for s in 0..CLICK_SHARDS {
-            click_ids[s].append(&mut out.click_ids[s]);
-            click_recs[s].append(&mut out.click_recs[s]);
+        for (bucket, rows) in out.clicks.iter_mut().enumerate() {
+            click_buckets[bucket].append(rows);
         }
         links.append(&mut out.links);
     }
     drop(outs);
     drop(files);
 
-    let mut shards: Vec<(Vec<u64>, Vec<EventRec>, Vec<Surv>)> = event_ids
-        .into_iter()
-        .zip(event_recs)
-        .map(|(ids, recs)| (ids, recs, Vec::new()))
-        .collect();
-    dedup_shards(&mut shards, threads);
-    let mut events_surv = Vec::new();
-    for shard in shards {
-        events_surv.extend(shard.2);
-    }
-
-    let mut click_shards: Vec<(Vec<u64>, Vec<ClickRec>, Vec<ClickRec>)> = click_ids
-        .into_iter()
-        .zip(click_recs)
-        .map(|(ids, recs)| (ids, recs, Vec::new()))
-        .collect();
-    dedup_click_shards(&mut click_shards, threads);
-    let mut clicks_surv = Vec::new();
-    for shard in click_shards {
-        clicks_surv.extend(shard.2);
-    }
+    let events_surv = dedup_event_buckets(event_buckets, threads);
+    let clicks_surv = dedup_click_buckets(click_buckets, threads);
 
     let t_dedup = t_stage.elapsed();
     let t_stage = Instant::now();
-    let (user_map, keys) = build_user_ids(&events_surv, &clicks_surv, &links, threads);
+    let (user_map, keys) = radix_user_ids(&events_surv, &clicks_surv, &links, threads);
 
     let n_users = keys.len();
     let mut parent: Vec<u32> = (0..n_users as u32).collect();
@@ -353,27 +328,8 @@ fn compute(data: &Path, threads: usize) -> Result<Tables, Box<dyn std::error::Er
 
     let t_union = t_stage.elapsed();
     let t_stage = Instant::now();
-    let mut evs = Vec::with_capacity(events_surv.len());
-    for e in events_surv {
-        let Some(dense) = user_map.get(e.user) else { continue };
-        evs.push(Ev {
-            person: parent[dense as usize],
-            ts: e.ts,
-            price: e.price,
-            cat: e.cat,
-            kind: e.kind,
-        });
-    }
-    let mut cls = Vec::with_capacity(clicks_surv.len());
-    for c in clicks_surv {
-        let Some(dense) = user_map.get(c.user) else { continue };
-        cls.push(Cl {
-            person: parent[dense as usize],
-            ts: c.ts,
-            id: c.id,
-            camp: c.camp,
-        });
-    }
+    let evs = remap_events(&events_surv, &user_map, &parent, threads);
+    let cls = remap_clicks(&clicks_surv, &user_map, &parent, threads);
     drop(user_map);
     drop(parent);
     drop(links);
@@ -956,25 +912,11 @@ fn dedup_events(ids: &[u64], recs: &[EventRec]) -> Vec<Surv> {
     for (id, rec) in ids.iter().zip(recs) {
         if let Some(idx) = map.get(*id) {
             if rec.ingest < stored[idx as usize].ingest {
-                stored[idx as usize] = EventRec {
-                    ts: rec.ts,
-                    ingest: rec.ingest,
-                    user: rec.user,
-                    price: rec.price,
-                    cat: rec.cat,
-                    kind: rec.kind,
-                };
+                stored[idx as usize] = *rec;
             }
         } else {
             let idx = stored.len() as u32;
-            stored.push(EventRec {
-                ts: rec.ts,
-                ingest: rec.ingest,
-                user: rec.user,
-                price: rec.price,
-                cat: rec.cat,
-                kind: rec.kind,
-            });
+            stored.push(*rec);
             map.insert(*id, idx);
         }
     }
@@ -1322,35 +1264,489 @@ fn scan(buf: &[u8], mut f: impl FnMut(&[u32; 8], &[u32; 8], &[bool; 8], usize)) 
     }
 }
 
+fn mix_id(id: u64) -> u64 {
+    let x = id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^ (x >> 32)
+}
+
+fn dedup_event_buckets(mut buckets: Vec<Vec<EventRec>>, threads: usize) -> Vec<Surv> {
+    let threads = threads.max(1).min(buckets.len());
+    let width = buckets.len().div_ceil(threads);
+    let mut parts: Vec<Vec<Surv>> = std::iter::repeat_with(Vec::new).take(threads).collect();
+    thread::scope(|scope| {
+        let mut groups = buckets.chunks_mut(width);
+        for part in &mut parts {
+            let Some(slice) = groups.next() else { break };
+            scope.spawn(move || {
+                for bucket in slice.iter_mut() {
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    bucket.sort_unstable_by(|a, b| a.id.cmp(&b.id).then(a.ingest.cmp(&b.ingest)));
+                    let mut i = 0;
+                    while i < bucket.len() {
+                        let rec = bucket[i];
+                        let mut j = i + 1;
+                        while j < bucket.len() && bucket[j].id == rec.id {
+                            j += 1;
+                        }
+                        if rec.kind != 255 && rec.user != 0 {
+                            part.push(Surv {
+                                user: rec.user,
+                                ts: rec.ts,
+                                price: rec.price,
+                                cat: rec.cat,
+                                kind: rec.kind,
+                            });
+                        }
+                        i = j;
+                    }
+                }
+            });
+        }
+    });
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+fn dedup_click_buckets(mut buckets: Vec<Vec<ClickRec>>, threads: usize) -> Vec<ClickRec> {
+    let threads = threads.max(1).min(buckets.len());
+    let width = buckets.len().div_ceil(threads);
+    let mut parts: Vec<Vec<ClickRec>> = std::iter::repeat_with(Vec::new).take(threads).collect();
+    thread::scope(|scope| {
+        let mut groups = buckets.chunks_mut(width);
+        for part in &mut parts {
+            let Some(slice) = groups.next() else { break };
+            scope.spawn(move || {
+                for bucket in slice.iter_mut() {
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    bucket.sort_unstable_by_key(|rec| rec.id);
+                    let mut i = 0;
+                    while i < bucket.len() {
+                        let id = bucket[i].id;
+                        part.push(bucket[i]);
+                        i += 1;
+                        while i < bucket.len() && bucket[i].id == id {
+                            i += 1;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+fn dedup_events_bucket(recs: Vec<EventRec>, threads: usize) -> Vec<Surv> {
+    const BUCKETS: usize = 256;
+    let n = recs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let threads = threads.max(1).min(n);
+    let mut counts = vec![vec![0u32; BUCKETS]; threads];
+    thread::scope(|scope| {
+        for (t, count) in counts.iter_mut().enumerate() {
+            let sl = &recs[t * n / threads..(t + 1) * n / threads];
+            scope.spawn(move || {
+                for rec in sl {
+                    count[(mix_id(rec.id) as usize) & 255] += 1;
+                }
+            });
+        }
+    });
+    let mut bucket_at = vec![0u32; BUCKETS + 1];
+    let mut cursor = vec![vec![0u32; BUCKETS]; threads];
+    let mut run = 0u32;
+    for bucket in 0..BUCKETS {
+        bucket_at[bucket] = run;
+        for t in 0..threads {
+            let count = counts[t][bucket];
+            cursor[t][bucket] = run;
+            run += count;
+        }
+    }
+    bucket_at[BUCKETS] = run;
+    let mut placed = Vec::<EventRec>::with_capacity(n);
+    unsafe { placed.set_len(n) };
+    let dst = SendPtr(placed.as_mut_ptr());
+    thread::scope(|scope| {
+        for (t, cur) in cursor.iter_mut().enumerate() {
+            let sl = &recs[t * n / threads..(t + 1) * n / threads];
+            let dst = dst;
+            scope.spawn(move || {
+                for rec in sl {
+                    let bucket = (mix_id(rec.id) as usize) & 255;
+                    let at = cur[bucket] as usize;
+                    cur[bucket] += 1;
+                    unsafe { dst.write(at, *rec) };
+                }
+            });
+        }
+    });
+    drop(recs);
+    let mut parts = std::iter::repeat_with(Vec::new).take(threads).collect::<Vec<_>>();
+    let ptr = SendPtr(placed.as_mut_ptr());
+    let bucket_at_ref = &bucket_at;
+    thread::scope(|scope| {
+        for (t, part) in parts.iter_mut().enumerate() {
+            let b0 = t * BUCKETS / threads;
+            let b1 = (t + 1) * BUCKETS / threads;
+            scope.spawn(move || {
+                for bucket in b0..b1 {
+                    let start = bucket_at_ref[bucket] as usize;
+                    let len = bucket_at_ref[bucket + 1] as usize - start;
+                    if len == 0 {
+                        continue;
+                    }
+                    let sl = unsafe { ptr.slice(start, len) };
+                    sl.sort_unstable_by(|a, b| a.id.cmp(&b.id).then(a.ingest.cmp(&b.ingest)));
+                    let mut i = 0;
+                    while i < sl.len() {
+                        let rec = sl[i];
+                        let mut j = i + 1;
+                        while j < sl.len() && sl[j].id == rec.id {
+                            j += 1;
+                        }
+                        if rec.kind != 255 && rec.user != 0 {
+                            part.push(Surv {
+                                user: rec.user,
+                                ts: rec.ts,
+                                price: rec.price,
+                                cat: rec.cat,
+                                kind: rec.kind,
+                            });
+                        }
+                        i = j;
+                    }
+                }
+            });
+        }
+    });
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+fn dedup_clicks_bucket(recs: Vec<ClickRec>, threads: usize) -> Vec<ClickRec> {
+    const BUCKETS: usize = 256;
+    let n = recs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let threads = threads.max(1).min(n);
+    let mut counts = vec![vec![0u32; BUCKETS]; threads];
+    thread::scope(|scope| {
+        for (t, count) in counts.iter_mut().enumerate() {
+            let sl = &recs[t * n / threads..(t + 1) * n / threads];
+            scope.spawn(move || {
+                for rec in sl {
+                    count[(mix_id(rec.id) as usize) & 255] += 1;
+                }
+            });
+        }
+    });
+    let mut bucket_at = vec![0u32; BUCKETS + 1];
+    let mut cursor = vec![vec![0u32; BUCKETS]; threads];
+    let mut run = 0u32;
+    for bucket in 0..BUCKETS {
+        bucket_at[bucket] = run;
+        for t in 0..threads {
+            let count = counts[t][bucket];
+            cursor[t][bucket] = run;
+            run += count;
+        }
+    }
+    bucket_at[BUCKETS] = run;
+    let mut placed = Vec::<ClickRec>::with_capacity(n);
+    unsafe { placed.set_len(n) };
+    let dst = SendPtr(placed.as_mut_ptr());
+    thread::scope(|scope| {
+        for (t, cur) in cursor.iter_mut().enumerate() {
+            let sl = &recs[t * n / threads..(t + 1) * n / threads];
+            let dst = dst;
+            scope.spawn(move || {
+                for rec in sl {
+                    let bucket = (mix_id(rec.id) as usize) & 255;
+                    let at = cur[bucket] as usize;
+                    cur[bucket] += 1;
+                    unsafe { dst.write(at, *rec) };
+                }
+            });
+        }
+    });
+    drop(recs);
+    let mut parts = std::iter::repeat_with(Vec::new).take(threads).collect::<Vec<_>>();
+    let ptr = SendPtr(placed.as_mut_ptr());
+    let bucket_at_ref = &bucket_at;
+    thread::scope(|scope| {
+        for (t, part) in parts.iter_mut().enumerate() {
+            let b0 = t * BUCKETS / threads;
+            let b1 = (t + 1) * BUCKETS / threads;
+            scope.spawn(move || {
+                for bucket in b0..b1 {
+                    let start = bucket_at_ref[bucket] as usize;
+                    let len = bucket_at_ref[bucket + 1] as usize - start;
+                    if len == 0 {
+                        continue;
+                    }
+                    let sl = unsafe { ptr.slice(start, len) };
+                    sl.sort_unstable_by_key(|rec| rec.id);
+                    let mut i = 0;
+                    while i < sl.len() {
+                        let id = sl[i].id;
+                        part.push(sl[i]);
+                        i += 1;
+                        while i < sl.len() && sl[i].id == id {
+                            i += 1;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+fn remap_events(events: &[Surv], users: &U64Map, parent: &[u32], threads: usize) -> Vec<Ev> {
+    let n = events.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let threads = threads.max(1).min(n);
+    let mut parts = std::iter::repeat_with(Vec::new).take(threads).collect::<Vec<_>>();
+    thread::scope(|scope| {
+        for (t, part) in parts.iter_mut().enumerate() {
+            let sl = &events[t * n / threads..(t + 1) * n / threads];
+            scope.spawn(move || {
+                part.reserve(sl.len());
+                for event in sl {
+                    let Some(dense) = users.get(event.user) else { continue };
+                    part.push(Ev {
+                        person: parent[dense as usize],
+                        ts: event.ts,
+                        price: event.price,
+                        cat: event.cat,
+                        kind: event.kind,
+                    });
+                }
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(n);
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+fn remap_clicks(clicks: &[ClickRec], users: &U64Map, parent: &[u32], threads: usize) -> Vec<Cl> {
+    let n = clicks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let threads = threads.max(1).min(n);
+    let mut parts = std::iter::repeat_with(Vec::new).take(threads).collect::<Vec<_>>();
+    thread::scope(|scope| {
+        for (t, part) in parts.iter_mut().enumerate() {
+            let sl = &clicks[t * n / threads..(t + 1) * n / threads];
+            scope.spawn(move || {
+                part.reserve(sl.len());
+                for click in sl {
+                    let Some(dense) = users.get(click.user) else { continue };
+                    part.push(Cl {
+                        person: parent[dense as usize],
+                        ts: click.ts,
+                        id: click.id,
+                        camp: click.camp,
+                    });
+                }
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(n);
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+fn dedup_sorted_events(recs: Vec<EventRec>) -> Vec<Surv> {
+    let mut out = Vec::with_capacity(recs.len());
+    let mut i = 0usize;
+    let n = recs.len();
+    while i < n {
+        let id = recs[i].id;
+        let mut best = i;
+        let mut j = i + 1;
+        while j < n && recs[j].id == id {
+            if recs[j].ingest < recs[best].ingest {
+                best = j;
+            }
+            j += 1;
+        }
+        let rec = recs[best];
+        if rec.kind != 255 && rec.user != 0 {
+            out.push(Surv {
+                user: rec.user,
+                ts: rec.ts,
+                price: rec.price,
+                cat: rec.cat,
+                kind: rec.kind,
+            });
+        }
+        i = j;
+    }
+    out
+}
+
+fn dedup_sorted_clicks(recs: Vec<ClickRec>) -> Vec<ClickRec> {
+    let mut out = Vec::with_capacity(recs.len());
+    let mut i = 0usize;
+    let n = recs.len();
+    while i < n {
+        let id = recs[i].id;
+        out.push(recs[i]);
+        i += 1;
+        while i < n && recs[i].id == id {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn radix_user_ids(
+    events: &[Surv],
+    clicks: &[ClickRec],
+    links: &[(u64, u64)],
+    threads: usize,
+) -> (U64Map, Vec<u64>) {
+    let mut keys = Vec::with_capacity(events.len() + clicks.len() + links.len() * 2);
+    for event in events {
+        keys.push(event.user);
+    }
+    for click in clicks {
+        keys.push(click.user);
+    }
+    for &(a, b) in links {
+        keys.push(a);
+        keys.push(b);
+    }
+    let keys = radix::par_radix_u64(keys, threads, |key| *key);
+    let mut uniq = Vec::with_capacity(keys.len() / 8 + 1);
+    let mut prev = 0u64;
+    for key in keys {
+        if key != 0 && key != prev {
+            uniq.push(key);
+            prev = key;
+        }
+    }
+    let mut map = U64Map::with_capacity(uniq.len().max(16));
+    for (index, key) in uniq.iter().enumerate() {
+        map.insert(*key, index as u32);
+    }
+    (map, uniq)
+}
+
+#[inline(always)]
+unsafe fn next_mark(p: *const u8, end: *const u8) -> *const u8 {
+    let len = unsafe { end.offset_from(p) } as usize;
+    let slice = unsafe { std::slice::from_raw_parts(p, len) };
+    match memchr::memchr3(b',', b'\n', b'"', slice) {
+        Some(index) => unsafe { p.add(index) },
+        None => end,
+    }
+}
+
+fn for_lines(buf: &[u8], mut on_line: impl FnMut(&[u8])) {
+    let mut i = 0usize;
+    while i < buf.len() {
+        let rel = memchr::memchr(b'\n', &buf[i..]).unwrap_or(buf.len() - i);
+        let line = &buf[i..i + rel];
+        i += rel + 1;
+        if !line.is_empty() {
+            on_line(line);
+        }
+    }
+}
+
+fn split_fields<'a>(line: &'a [u8], expect: usize) -> Option<([&'a [u8]; 8], usize)> {
+    let mut out = [b"".as_ref(); 8];
+    let mut n = 0usize;
+    let mut start = 0usize;
+    let mut saw_quote = false;
+    for (i, &c) in line.iter().enumerate() {
+        if c == b'"' {
+            saw_quote = true;
+        } else if c == b',' {
+            if n >= 8 {
+                return None;
+            }
+            out[n] = field_bytes(&line[start..i], saw_quote)?;
+            n += 1;
+            start = i + 1;
+            saw_quote = false;
+        }
+    }
+    if n >= 8 {
+        return None;
+    }
+    out[n] = field_bytes(&line[start..], saw_quote)?;
+    n += 1;
+    if n != expect {
+        return None;
+    }
+    Some((out, n))
+}
+
+fn field_bytes(value: &[u8], saw_quote: bool) -> Option<&[u8]> {
+    if !saw_quote {
+        return Some(value);
+    }
+    if value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"' && !value[1..value.len() - 1].contains(&b'"')
+    {
+        return Some(&value[1..value.len() - 1]);
+    }
+    None
+}
+
 fn parse_events(buf: &[u8], ctx: &Ctx<'_>, shared: &Shared, out: &mut ThreadOut) {
     let w = ctx.window;
-    scan(buf, |starts, ends, quotes, n| {
-        if n != 7 {
-            return;
-        }
-        let mut fields: [&[u8]; 7] = [b""; 7];
-        for i in 0..7 {
-            let Some(v) = clean(buf, starts[i], ends[i], quotes[i]) else { return };
-            fields[i] = v;
-        }
-        let Some(id) = id_key(shared, fields[0]) else { return };
-        let Some(ingest) = parse_ts(fields[3]) else { return };
-        let user = user_key(shared, fields[1]);
+    for_lines(buf, |line| {
+        let Some((raw, _)) = split_fields(line, 7) else { return };
+        let Some(id) = id_key(shared, raw[0]) else { return };
+        let Some(ingest) = parse_ts(raw[3]) else { return };
+        let user = user_key(shared, raw[1]);
         let mut kind = 255u8;
         let mut ts = 0i64;
         let mut price = 0u32;
         let mut cat = 0u8;
         if user != 0 {
-            if let Some(parsed) = parse_ts(fields[2]) {
+            if let Some(parsed) = parse_ts(raw[2]) {
                 if parsed >= w.start && parsed < w.end && !is_late(parsed, ingest) {
-                    if let Some(k) = kind_of(fields[4]) {
-                        if !fields[5].is_empty() {
+                    if let Some(k) = kind_of(raw[4]) {
+                        if !raw[5].is_empty() {
                             if k == 2 {
-                                if let Some(p) = parse_price(fields[6]) {
+                                if let Some(parsed_price) = parse_price(raw[6]) {
                                     kind = 2;
                                     ts = parsed;
-                                    price = p;
-                                    cat = product_cat(ctx, fields[5]);
+                                    price = parsed_price;
+                                    cat = product_cat(ctx, raw[5]);
                                 }
                             } else {
                                 kind = k;
@@ -1361,36 +1757,37 @@ fn parse_events(buf: &[u8], ctx: &Ctx<'_>, shared: &Shared, out: &mut ThreadOut)
                 }
             }
         }
-        let sh = shard_of(id, 5);
-        out.event_ids[sh].push(id);
-        out.event_recs[sh].push(EventRec { ts, ingest, user, price, cat, kind });
+        out.events[(mix_id(id) as usize) & 255].push(EventRec { id, user, ts, ingest, price, cat, kind });
     });
+}
+
+unsafe fn field_at<'a>(ptr: *const u8, len: u32, quoted: bool) -> Option<&'a [u8]> {
+    let len = len as usize;
+    let value = unsafe { std::slice::from_raw_parts(ptr, len) };
+    if !quoted {
+        return Some(value);
+    }
+    if len >= 2 && value[0] == b'"' && value[len - 1] == b'"' && !value[1..len - 1].contains(&b'"') {
+        return Some(&value[1..len - 1]);
+    }
+    None
 }
 
 fn parse_clicks(buf: &[u8], ctx: &Ctx<'_>, shared: &Shared, out: &mut ThreadOut) {
     let w = ctx.window;
-    scan(buf, |starts, ends, quotes, n| {
-        if n != 4 {
-            return;
-        }
-        let mut fields: [&[u8]; 4] = [b""; 4];
-        for i in 0..4 {
-            let Some(v) = clean(buf, starts[i], ends[i], quotes[i]) else { return };
-            fields[i] = v;
-        }
-        let Some(id) = id_key(shared, fields[0]) else { return };
-        let user = user_key(shared, fields[1]);
+    for_lines(buf, |line| {
+        let Some((raw, _)) = split_fields(line, 4) else { return };
+        let Some(id) = id_key(shared, raw[0]) else { return };
+        let user = user_key(shared, raw[1]);
         if user == 0 {
             return;
         }
-        let Some(ts) = parse_ts(fields[3]) else { return };
+        let Some(ts) = parse_ts(raw[3]) else { return };
         if ts < w.click_start || ts >= w.end {
             return;
         }
-        let Some(camp) = campaign_of(ctx, fields[2]) else { return };
-        let sh = shard_of(id, 3);
-        out.click_ids[sh].push(id);
-        out.click_recs[sh].push(ClickRec { ts, user, id, camp });
+        let Some(camp) = campaign_of(ctx, raw[2]) else { return };
+        out.clicks[(mix_id(id) as usize) & 255].push(ClickRec { ts, user, id, camp });
     });
 }
 
@@ -1414,7 +1811,7 @@ fn split_chunks(file: u16, kind: u8, bytes: &[u8]) -> Vec<ChunkLite> {
         return out;
     };
     let mut pos = nl + 1;
-    const SZ: usize = 256 * 1024;
+    const SZ: usize = 4 * 1024 * 1024;
     while pos < bytes.len() {
         let mut end = (pos + SZ).min(bytes.len());
         if end < bytes.len() {
@@ -1755,6 +2152,26 @@ fn write_debug_csv(dir: &Path, tables: &Tables) -> Result<(), Box<dyn std::error
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn bench_pack_and_time() {
+        let ts = b"2027-12-19T18:13:05Z";
+        let f3 = b"1791071890000";
+        let id = b"e42huhoug";
+        let user = b"uduffvac";
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..4_000_000 {
+            acc = acc.wrapping_add(parse_ts(std::hint::black_box(ts)).unwrap_or(0) as u64);
+            acc = acc.wrapping_add(parse_ts(std::hint::black_box(f3)).unwrap_or(0) as u64);
+            acc = acc.wrapping_add(try_pack(std::hint::black_box(id)).unwrap_or(0));
+            acc = acc.wrapping_add(try_pack(std::hint::black_box(user)).unwrap_or(0));
+        }
+        eprintln!("pack+ts {} ms acc {acc}", t.elapsed().as_millis());
+    }
+
     use super::*;
     use std::collections::BTreeSet;
 
