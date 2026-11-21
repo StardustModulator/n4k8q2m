@@ -109,32 +109,64 @@ pub fn civil_from_days(days: i64) -> Civil {
     }
 }
 
-#[inline]
-fn dig2(s: &[u8]) -> Option<i64> {
-    let a = s[0].wrapping_sub(b'0');
-    let b = s[1].wrapping_sub(b'0');
+#[inline(always)]
+fn two_digits(a: u8, b: u8) -> Option<i64> {
+    let a = a.wrapping_sub(b'0');
+    let b = b.wrapping_sub(b'0');
     if a > 9 || b > 9 {
         return None;
     }
     Some(a as i64 * 10 + b as i64)
 }
 
-#[inline]
-fn dig4(s: &[u8]) -> Option<i64> {
-    Some(dig2(&s[0..2])? * 100 + dig2(&s[2..4])?)
+/// High nibbles of eight ASCII digits collapse to `0x33`.
+#[inline(always)]
+fn eight_digits(word: u64) -> bool {
+    let mixed = (word & 0xF0F0_F0F0_F0F0_F0F0)
+        | (((word.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4);
+    mixed == 0x3333_3333_3333_3333
 }
 
-#[inline]
-fn civil_ms(s: &[u8]) -> Option<i64> {
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+#[inline(always)]
+fn pair_at(word: u64, byte: u32) -> i64 {
+    let v = word >> (byte * 8);
+    ((v & 0x0F) * 10 + ((v >> 8) & 0x0F)) as i64
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` at the front of `s` (19 bytes). No trailing `Z` check.
+#[inline(always)]
+fn clock_ms(s: &[u8]) -> Option<i64> {
+    if s.len() < 19 {
         return None;
     }
-    let year = dig4(&s[0..4])?;
-    let month = dig2(&s[5..7])?;
-    let day = dig2(&s[8..10])?;
-    let hour = dig2(&s[11..13])?;
-    let minute = dig2(&s[14..16])?;
-    let second = dig2(&s[17..19])?;
+    let w0 = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let w1 = u64::from_le_bytes(s[8..16].try_into().unwrap());
+    // Bytes 4 and 7 are `-`. Byte 10 (`w1` byte 2) is `T`. Byte 13 (`w1` byte 5) and 16 are `:`.
+    const M0: u64 = (0xFFu64 << 32) | (0xFFu64 << 56);
+    const V0: u64 = (0x2Du64 << 32) | (0x2Du64 << 56);
+    const M1: u64 = (0xFFu64 << 16) | (0xFFu64 << 40);
+    const V1: u64 = (0x54u64 << 16) | (0x3Au64 << 40);
+    const Z0: u64 = (0x30u64 << 32) | (0x30u64 << 56);
+    const Z1: u64 = (0x30u64 << 16) | (0x30u64 << 40);
+    if (w0 & M0) != V0 || (w1 & M1) != V1 || s[16] != b':' {
+        return None;
+    }
+    let d0 = (w0 & !M0) | Z0;
+    let d1 = (w1 & !M1) | Z1;
+    if !eight_digits(d0) || !eight_digits(d1) {
+        return None;
+    }
+    let sec_hi = s[17].wrapping_sub(b'0');
+    let sec_lo = s[18].wrapping_sub(b'0');
+    if sec_hi > 9 || sec_lo > 9 {
+        return None;
+    }
+    let year = pair_at(d0, 0) * 100 + pair_at(d0, 2);
+    let month = pair_at(d0, 5);
+    let day = pair_at(d1, 0);
+    let hour = pair_at(d1, 3);
+    let minute = pair_at(d1, 6);
+    let second = sec_hi as i64 * 10 + sec_lo as i64;
     if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
@@ -142,19 +174,48 @@ fn civil_ms(s: &[u8]) -> Option<i64> {
     Some(days * DAY_MS + ((hour * 60 + minute) * 60 + second) * SECOND)
 }
 
+#[inline(always)]
+fn f3_ms(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n == 0 || n > 19 {
+        return None;
+    }
+    let mut v: u64 = 0;
+    let mut i = 0;
+    // 8-digit SWAR chunks (Lemire).
+    while i + 8 <= n {
+        let word = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        if !eight_digits(word) {
+            return None;
+        }
+        let mut chunk = (word & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+        chunk = (chunk & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+        chunk = (chunk & 0x0000_FFFF_0000_FFFF).wrapping_mul(4_294_967_296_0001) >> 32;
+        v = v.checked_mul(100_000_000)?.checked_add(chunk)?;
+        i += 8;
+    }
+    while i < n {
+        let d = s[i].wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add(d as u64)?;
+        i += 1;
+    }
+    i64::try_from(v).ok()
+}
+
 /// F1 `YYYY-MM-DDTHH:MM:SSZ`, F2 with `±HH:MM`, or F3 digits (leading zeros allowed).
 #[inline(always)]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
-    if s.is_empty() {
-        return None;
+    let n = s.len();
+    if n == 20 && s[19] == b'Z' {
+        return clock_ms(s);
     }
-    if s.len() == 20 && s[19] == b'Z' {
-        return civil_ms(s);
-    }
-    if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
-        let local = civil_ms(&s[..19])?;
-        let hh = dig2(&s[20..22])?;
-        let mm = dig2(&s[23..25])?;
+    if n == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+        let local = clock_ms(s)?;
+        let hh = two_digits(s[20], s[21])?;
+        let mm = two_digits(s[23], s[24])?;
         if hh > 23 || mm > 59 {
             return None;
         }
@@ -162,19 +223,10 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
         let signed = if s[19] == b'-' { -off } else { off };
         return Some(local - signed);
     }
-    // F3. A value that does not fit in i64 is outside every window.
-    if !s[0].is_ascii_digit() {
+    if n == 0 || !s[0].is_ascii_digit() {
         return None;
     }
-    let mut v: u64 = 0;
-    for &c in s {
-        let d = c.wrapping_sub(b'0');
-        if d > 9 {
-            return None;
-        }
-        v = v.checked_mul(10)?.checked_add(d as u64)?;
-    }
-    i64::try_from(v).ok()
+    f3_ms(s)
 }
 
 pub fn format_day(days: i32, out: &mut [u8; 10]) {
@@ -207,6 +259,28 @@ mod tests {
         assert_eq!(f1, f2);
         assert_eq!(parse_ts(b"2026-10-03T23:58:10-00:00").unwrap(), f1);
         assert_eq!(parse_ts(b"0001791071890000"), parse_ts(b"1791071890000"));
+        for raw in [
+            "1828714230000",
+            "1828462575000",
+            "1828627771436",
+            "1829088235000",
+        ] {
+            assert_eq!(parse_ts(raw.as_bytes()).unwrap(), raw.parse::<i64>().unwrap(), "{raw}");
+        }
+        let z = parse_ts(b"2027-12-09T00:02:51Z").unwrap();
+        assert_eq!(parse_ts(b"2027-12-09T00:02:51+00:00").unwrap(), z);
+        assert_eq!(parse_ts(b"2027-12-09T04:21:07-04:00").unwrap(), parse_ts(b"2027-12-09T08:21:07Z").unwrap());
+        assert_eq!(parse_ts(b"2027-12-11T07:06:43-09:30").unwrap(), parse_ts(b"2027-12-11T16:36:43Z").unwrap());
+        assert_eq!(parse_ts(b"2027-12-23T02:49:37+08:45").unwrap(), parse_ts(b"2027-12-22T18:04:37Z").unwrap());
+        assert!(parse_ts(b"2027-12-20T20:05:48Z").is_some());
+        assert!(parse_ts(b"2027-12-09T16:15:48Z").is_some());
+        assert!(parse_ts(b"2027-12-15T16:26:59Z").is_some());
+        for day in 1..=31 {
+            for hour in 0..24 {
+                let s = format!("2027-12-{day:02}T{hour:02}:05:48Z");
+                assert!(parse_ts(s.as_bytes()).is_some(), "{s}");
+            }
+        }
         assert!(parse_ts(b"2028-02-29T00:00:00Z").is_some());
         assert!(parse_ts(b"2027-02-29T00:00:00Z").is_none());
         assert!(parse_ts(b"2026-02-30T00:00:00Z").is_none());

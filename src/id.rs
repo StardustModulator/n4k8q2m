@@ -20,6 +20,23 @@ pub fn slow_key(index: u32) -> u64 {
     SLOW_TAG | index as u64
 }
 
+/// Base36 digit, or `0xFF` when the byte is not a digit or letter.
+const B36: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut c = b'0';
+    while c <= b'9' {
+        t[c as usize] = c - b'0';
+        c += 1;
+    }
+    let mut i = 0u8;
+    while i < 26 {
+        t[(b'a' + i) as usize] = 10 + i;
+        t[(b'A' + i) as usize] = 10 + i;
+        i += 1;
+    }
+    t
+};
+
 /// `None` when the text is not a canonical all-lower or all-upper base36 id.
 #[inline(always)]
 pub fn try_pack(s: &[u8]) -> Option<u64> {
@@ -40,15 +57,13 @@ pub fn try_pack(s: &[u8]) -> Option<u64> {
     let mut i = 1;
     while i < n {
         let c = s[i];
-        let digit = if c.wrapping_sub(b'0') <= 9 {
-            c - b'0'
-        } else if lower && c.wrapping_sub(b'a') <= 25 {
-            c - b'a' + 10
-        } else if upper && c.wrapping_sub(b'A') <= 25 {
-            c - b'A' + 10
-        } else {
+        let digit = B36[c as usize];
+        if digit == 0xFF {
             return None;
-        };
+        }
+        if digit >= 10 && (c >= b'a') == upper {
+            return None;
+        }
         value = value * 36 + digit as u64;
         i += 1;
     }

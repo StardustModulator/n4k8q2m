@@ -15,7 +15,7 @@ memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 opt-level = 3
 panic = "abort"
