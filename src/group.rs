@@ -39,7 +39,6 @@ pub(super) struct Scratch {
 }
 
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
-
 // Within a person shard the table and cursors fit in private caches: number
 // every row by its person's slot, count, then scatter each person's events
 // and clicks together. Neither events nor clicks get sorted (see `aggregate`).
@@ -49,7 +48,12 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     let ne = parts.iter().map(|p| p.ev.len()).sum::<usize>();
     if ne == 0 { return; }
     let nc = parts.iter().map(|p| p.cl.len()).sum::<usize>();
-    #[cfg(test)]
+    // Rows grow by a large step so the vector rarely moves; a bin yields a
+    // small fraction of its events in rows, and untouched capacity costs no
+    // pages.
+    if acc.rows.capacity() - acc.rows.len() < ne {
+        acc.rows.reserve(ne * 64);
+    }
     let t0 = Instant::now();
     let mut bits = (ne / 8).max(64).next_power_of_two().trailing_zeros();
     let mut sc = std::mem::take(&mut acc.scratch);
@@ -63,7 +67,6 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
         slots.fill(Slot::default());
         bits += 1;
     }
-    #[cfg(test)]
     let t1 = Instant::now();
     let (mut es, mut cs) = (0u32, 0u32);
     for p in &mut slots {
@@ -80,21 +83,34 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     // `number` gave every event a slot below slots.len() and counted it in
     // that slot, so each cursor stays below the next slot's start <= es (cs).
     let (ev_ids, cl_ids) = ids[..ne + nc].split_at(ne);
-    for (r, &id) in parts.iter().flat_map(|p| &p.ev).zip(ev_ids) {
-        // SAFETY: see above.
-        let cursor = unsafe { &mut slots.get_unchecked_mut(id as usize).ev };
-        unsafe { *ev.get_unchecked_mut(*cursor as usize) = r.val };
-        *cursor += 1;
-    }
-    for (r, &id) in parts.iter().flat_map(|p| &p.cl).zip(cl_ids) {
-        if id != u32::MAX {
+    // Counted loops here; the numbering keeps its iterator form, which
+    // measured faster on x86 although it is longer.
+    let mut n = 0;
+    for p in &parts {
+        for r in &p.ev {
+            // SAFETY: n counts the events, which have one number each.
+            let id = unsafe { *ev_ids.get_unchecked(n) } as usize;
+            n += 1;
             // SAFETY: see above.
-            let cursor = unsafe { &mut slots.get_unchecked_mut(id as usize).cl };
-            unsafe { *cl.get_unchecked_mut(*cursor as usize) = r.hit };
+            let cursor = unsafe { &mut slots.get_unchecked_mut(id).ev };
+            unsafe { *ev.get_unchecked_mut(*cursor as usize) = r.val };
             *cursor += 1;
         }
     }
-    #[cfg(test)]
+    let mut n = 0;
+    for p in &parts {
+        for r in &p.cl {
+            // SAFETY: n counts the clicks, which have one number each.
+            let id = unsafe { *cl_ids.get_unchecked(n) } as usize;
+            n += 1;
+            if id != u32::MAX as usize {
+                // SAFETY: see above.
+                let cursor = unsafe { &mut slots.get_unchecked_mut(id).cl };
+                unsafe { *cl.get_unchecked_mut(*cursor as usize) = r.hit };
+                *cursor += 1;
+            }
+        }
+    }
     let t2 = Instant::now();
     let (mut e0, mut c0) = (0, 0);
     for p in &mut slots {
@@ -108,8 +124,12 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     }
     sc.slots = slots;
     acc.scratch = sc;
+    let t3 = Instant::now();
     #[cfg(test)]
-    bench::phase([t0, t1, t2, Instant::now()]);
+    bench::phase([t0, t1, t2, t3]);
+    for (p, (a, b)) in acc.phases.0.iter_mut().zip([(t0, t1), (t1, t2), (t2, t3)]) {
+        *p += (b - a).as_nanos() as u64;
+    }
 }
 
 // Open addressing with linear probing; a slot number is a person's number.
@@ -122,8 +142,7 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
     let slots = &mut slots[..];
     let shift = 64 - bits;
     let mut room = mask / 4 * 3;
-    let (ev_ids, cl_ids) = ids.split_at_mut(parts.iter().map(|p| p.ev.len()).sum());
-    let mut out = ev_ids.iter_mut();
+    let mut out = ids.iter_mut();
     for e in parts.iter().flat_map(|p| &p.ev) {
         let key = e.key;
         let s = (key.wrapping_mul(MUL) >> shift) as usize;
@@ -144,20 +163,26 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
         unsafe { slots.get_unchecked_mut(id) }.ev += 1;
         if let Some(o) = out.next() { *o = id as u32; }
     }
-    let mut out = cl_ids.iter_mut();
-    for c in parts.iter().flat_map(|p| &p.cl) {
-        let key = c.key;
-        let s = (key.wrapping_mul(MUL) >> shift) as usize;
-        // SAFETY: as for events.
-        let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
-        if unsafe { slots.get_unchecked(id) }.key != key {
-            id = probe(slots, key, s, mask);
+    let mut n = parts.iter().map(|p| p.ev.len()).sum::<usize>();
+    for p in parts {
+        for c in &p.cl {
+            let key = c.key;
+            let s = (key.wrapping_mul(MUL) >> shift) as usize;
+            // SAFETY: as for events.
+            let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
+            if unsafe { slots.get_unchecked(id) }.key != key {
+                id = probe(slots, key, s, mask);
+            }
+            // A person without events has no sessions to credit.
+            let found = slots[id].key == key;
+            if found { slots[id].cl += 1; }
+            // SAFETY: the caller sizes `ids` to the events plus the clicks,
+            // and n counts them in that order, so n < ids.len().
+            unsafe { *ids.get_unchecked_mut(n) = if found { id as u32 } else { u32::MAX } };
+            n += 1;
         }
-        // A person without events has no sessions to credit.
-        let found = slots[id].key == key;
-        if found { slots[id].cl += 1; }
-        if let Some(o) = out.next() { *o = if found { id as u32 } else { u32::MAX }; }
     }
+    debug_assert_eq!(n, ids.len());
     true
 }
 
