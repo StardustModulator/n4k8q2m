@@ -4,6 +4,7 @@ mod atom;
 mod clock;
 #[cfg(test)]
 mod fixture;
+mod group;
 mod links;
 mod output;
 mod stream;
