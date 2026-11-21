@@ -486,8 +486,43 @@ mod bench {
             wire::rows::<7>(body, |f| acc += f[0].len() + f[6].len());
             std::hint::black_box(acc);
         });
+        report("+id", &mut || {
+            let mut acc = 0u64;
+            wire::rows::<7>(body, |f| { if let Some(id) = id_key(&shared, f[0]) { acc ^= id; } });
+            std::hint::black_box(acc);
+        });
+        report("+ingest", &mut || {
+            let mut acc = 0u64;
+            wire::rows::<7>(body, |f| {
+                let Some(id) = id_key(&shared, f[0]) else { return };
+                let Some(at) = clock.ingest(f[3]) else { return };
+                acc ^= id ^ at as u64;
+            });
+            std::hint::black_box(acc);
+        });
+        report("+payload", &mut || {
+            let mut acc = 0u64;
+            wire::rows::<7>(body, |f| {
+                let Some(id) = id_key(&shared, f[0]) else { return };
+                let Some(at) = clock.ingest(f[3]) else { return };
+                let v = payload(&f, &cx, &clock, at, origin).unwrap_or(0);
+                acc ^= id ^ at as u64 ^ v;
+            });
+            std::hint::black_box(acc);
+        });
+        report("+user", &mut || {
+            let mut acc = 0u64;
+            wire::rows::<7>(body, |f| {
+                let Some(id) = id_key(&shared, f[0]) else { return };
+                let Some(at) = clock.ingest(f[3]) else { return };
+                let v = payload(&f, &cx, &clock, at, origin).unwrap_or(0);
+                let u = if f[1].is_empty() { 0 } else { user_key(&shared, f[1]) };
+                acc ^= id ^ at as u64 ^ v ^ u;
+            });
+            std::hint::black_box(acc);
+        });
         report("scan_events", &mut || {
-            let mut out = Scan { ev: bins(2048), cl: Vec::new(), links: Vec::new() };
+            let mut out = Scan { ev: (0..2048).map(|_| Vec::with_capacity(rows_n / 2048 + 64)).collect(), cl: Vec::new(), links: Vec::new() };
             scan_events(body, &cx, &clock, &shared, &mut out, origin);
             std::hint::black_box(&out.ev);
         });
