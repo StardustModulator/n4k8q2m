@@ -97,45 +97,19 @@ fn scan_clicks(buf: &[u8], cx: &Ctx<'_>, clock: &Clock, s: &Shared, out: &mut Sc
     });
 }
 
-// Only used within a bucket. Favor the largest allocation as backing storage
-// and keep the copying on the worker that immediately consumes these records.
-fn join_parts<T>(mut p: Vec<Vec<T>>) -> Vec<T> {
-    let n: usize = p.iter().map(Vec::len).sum();
-    let Some((big, _)) = p.iter().enumerate().max_by_key(|(_, s)| s.len()) else { return Vec::new() };
-    let mut out = p.swap_remove(big);
-    out.reserve_exact(n - out.len());
-    for mut v in p { out.append(&mut v); }
-    out
-}
-
-// Cache one exact alias lookup for frequently accessed devices. A miss is
-// always resolved against the complete graph, including ids with no event.
-struct NameCache(Vec<(u64, u64)>);
-impl NameCache {
-    fn new() -> Self { Self(vec![(0, 0); 8192]) }
-    #[inline(always)]
-    fn name(&mut self, key: u64, aliases: &Aliases) -> u64 {
-        let i = hash(key) as usize & (self.0.len() - 1);
-        let slot = &mut self.0[i];
-        if slot.0 == key { return slot.1; }
-        let v = aliases.resolve(key);
-        *slot = (key, v);
-        v
-    }
-}
-
-fn reduce_event_ids(parts: Vec<Vec<Record>>, aliases: &Aliases, cache: &mut NameCache, dest: &mut [Histories]) {
-    let mut rows = join_parts(parts);
-    if rows.is_empty() { return; }
+// Copies of one id may sit in different workers' parts. The parts are read
+// in place; concatenating them would copy every record into fresh pages.
+fn reduce_event_ids(mut parts: Vec<Vec<Record>>, dest: &mut [Histories], shift: u32) {
+    let n: usize = parts.iter().map(Vec::len).sum();
+    if n == 0 { return; }
     // Two bits per hash prefix. A prefix seen once cannot be a duplicate, so
     // those rows skip the id table. A shared prefix is only a suspect: the
     // exact table still compares full ids.
-    let n = rows.len();
-    let words = ((n + 3) / 4).next_power_of_two().max(1);
+    let words = n.div_ceil(4).next_power_of_two();
     let word_mask = words - 1;
     let mut present = vec![0u64; words];
     let mut repeated = vec![0u64; words];
-    for r in &rows {
+    for r in parts.iter().flatten() {
         let h = hash(r.id);
         let bit = 1u64 << (h & 63);
         let i = ((h >> 6) as usize) & word_mask;
@@ -148,52 +122,90 @@ fn reduce_event_ids(parts: Vec<Vec<Record>>, aliases: &Aliases, cache: &mut Name
         suspects -= (present[i] ^ repeated[i]).count_ones() as usize;
     }
     if suspects > 0 {
+        // Slot value: part index + 1 in the high half, row in the low half.
         let mask = (suspects * 2).next_power_of_two() - 1;
-        let mut table = vec![0u32; mask + 1];
-        for i in 0..n {
-            let h = hash(rows[i].id);
-            if ((repeated[((h >> 6) as usize) & word_mask] >> (h & 63)) & 1) == 0 {
-                continue;
-            }
-            let mut s = hash(rows[i].id.wrapping_mul(0x9e37_79b9_7f4a_7c15)) as usize & mask;
-            loop {
-                let ptr = table[s];
-                if ptr == 0 {
-                    table[s] = (i + 1) as u32;
-                    break;
+        let mut table = vec![0u64; mask + 1];
+        for p in 0..parts.len() {
+            for i in 0..parts[p].len() {
+                let id = parts[p][i].id;
+                let h = hash(id);
+                if ((repeated[((h >> 6) as usize) & word_mask] >> (h & 63)) & 1) == 0 {
+                    continue;
                 }
-                let j = (ptr - 1) as usize;
-                if rows[j].id == rows[i].id {
-                    if rows[i].at < rows[j].at {
-                        rows[j].user = 0;
-                        table[s] = (i + 1) as u32;
-                    } else {
-                        rows[i].user = 0;
+                let me = ((p as u64 + 1) << 32) | i as u64;
+                let mut s = hash(id.wrapping_mul(0x9e37_79b9_7f4a_7c15)) as usize & mask;
+                loop {
+                    let ptr = table[s];
+                    if ptr == 0 {
+                        table[s] = me;
+                        break;
                     }
-                    break;
+                    let (q, j) = ((ptr >> 32) as usize - 1, ptr as u32 as usize);
+                    if parts[q][j].id == id {
+                        if parts[p][i].at < parts[q][j].at {
+                            parts[q][j].user = 0;
+                            table[s] = me;
+                        } else {
+                            parts[p][i].user = 0;
+                        }
+                        break;
+                    }
+                    s = (s + 1) & mask;
                 }
-                s = (s + 1) & mask;
             }
         }
     }
-    let mask = dest.len() - 1;
-    for r in rows {
+    for r in parts.into_iter().flatten() {
         if r.user != 0 {
-            let key = cache.name(r.user, aliases);
-            dest[(hash(key) >> 32) as usize & mask].ev.push(Event { key, val: r.val });
+            dest[(hash(r.user) >> shift) as usize].ev.push(Event { key: r.user, val: r.val });
         }
     }
 }
 
-fn route_clicks(rows: Vec<Click>, aliases: &Aliases, cache: &mut NameCache, dest: &mut [Histories]) {
+fn route_clicks(rows: Vec<Click>, dest: &mut [Histories], shift: u32) {
     // All copies of a click are identical. Window membership is existential
     // per campaign and credit is a min/max over keys. Both are idempotent:
     // duplicating an identical tuple cannot change either result.
-    let mask = dest.len() - 1;
-    for mut r in rows {
-        r.key = cache.name(r.key, aliases);
-        dest[(hash(r.key) >> 32) as usize & mask].cl.push(r);
+    for r in rows {
+        dest[(hash(r.key) >> shift) as usize].cl.push(r);
     }
+}
+
+// Every raw user in this bin shares its top hash bits with exactly one alias
+// shard, so these lookups stay in a cache-sized table. A user named by itself
+// already lives in its person's bin: such rows are compacted in place and only
+// renamed rows are scattered.
+fn rename(mut parts: Vec<Histories>, aliases: &Aliases, dest: &mut [Histories], shift: u32, bin: usize) -> Vec<Histories> {
+    for p in &mut parts {
+        let mut kept = 0;
+        for i in 0..p.ev.len() {
+            let mut e = p.ev[i];
+            let name = aliases.resolve(e.key);
+            if name == e.key {
+                p.ev[kept] = e;
+                kept += 1;
+            } else {
+                e.key = name;
+                dest[(hash(name) >> shift) as usize].ev.push(e);
+            }
+        }
+        p.ev.truncate(kept);
+        let mut kept = 0;
+        for i in 0..p.cl.len() {
+            let mut c = p.cl[i];
+            let name = aliases.resolve(c.key);
+            if name == c.key {
+                p.cl[kept] = c;
+                kept += 1;
+            } else {
+                c.key = name;
+                dest[(hash(name) >> shift) as usize].cl.push(c);
+            }
+        }
+        p.cl.truncate(kept);
+    }
+    debug_assert!(parts.iter().all(|p| p.ev.iter().all(|e| (hash(e.key) >> shift) as usize == bin)));
+    parts
 }
 
 #[derive(Clone, Copy, Default)]
@@ -349,7 +361,8 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     let prep=total.elapsed();
     let scans=thread::scope(|scope|{
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
-            let mut out=Scan{ev:bins(eb),cl:Vec::new(),links:Vec::new()};
+            let per_bin=event_bytes/(70*eb*threads)+64;
+            let mut out=Scan{ev:(0..eb).map(|_|Vec::with_capacity(per_bin)).collect(),cl:Vec::new(),links:Vec::new()};
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
@@ -378,18 +391,27 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         if !s.cl.is_empty(){jobs.push(Route::Cl(s.cl));}
         lks.push(s.links);
     }
-    let aliases=links::build(lks,&slow,threads);
+    let aliases=links::build(lks,&slow,threads,pb);
     let indexed=total.elapsed();
     jobs.extend(parts.into_iter().map(Route::Ev));
-    let routed=consume(jobs,threads,||((0..pb).map(|_| Histories::default()).collect::<Vec<_>>(),NameCache::new()),
-        |(out,cache),j|match j{
-            Route::Ev(rows)=>reduce_event_ids(rows,&aliases,cache,out),
-            Route::Cl(rows)=>route_clicks(rows,&aliases,cache,out),
+    let shift=64-pb.trailing_zeros();
+    let hist=||(0..pb).map(|_| Histories::default()).collect::<Vec<_>>();
+    let routed=consume(jobs,threads,hist,
+        |out,j|match j{
+            Route::Ev(rows)=>reduce_event_ids(rows,out,shift),
+            Route::Cl(rows)=>route_clicks(rows,out,shift),
         });
     let reduced=total.elapsed();
+    let mut by_user:Vec<Vec<Histories>>=bins(pb);
+    for r in routed {
+        for (dst,src) in by_user.iter_mut().zip(r) {dst.push(src);}
+    }
+    let named=consume(by_user.into_iter().enumerate().collect(),threads,||(hist(),Vec::new()),
+        |(out,kept),(b,job)|kept.push((b,rename(job,&aliases,out,shift,b))));
     let mut by_name:Vec<Vec<Histories>>=bins(pb);
-    for (r,_) in routed {
+    for (r,kept) in named {
         for (dst,src) in by_name.iter_mut().zip(r) {dst.push(src);}
+        for (b,mut parts) in kept {by_name[b].append(&mut parts);}
     }
     by_name.sort_unstable_by_key(|s|std::cmp::Reverse(s.iter().map(|p|p.ev.len()+p.cl.len()).sum::<usize>()));
     let partials=consume(by_name,threads,||Acc::new(camps.len(),days,cat_names.len()),
@@ -410,7 +432,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         }
     }
     if std::env::var_os("STAGES").is_some() {
-        eprintln!("ms prep={} parse={} links={} dedup+route={} histories={} merge={}",
+        eprintln!("ms prep={} parse={} links={} dedup+route+rename={} histories={} merge={}",
             prep.as_millis(),(parsed-prep).as_millis(),(indexed-parsed).as_millis(),(reduced-indexed).as_millis(),
             (grouped-reduced).as_millis(),(total.elapsed()-grouped).as_millis());
     }

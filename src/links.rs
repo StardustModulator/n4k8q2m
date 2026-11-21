@@ -236,6 +236,7 @@ pub(super) fn build(
     parts: Vec<Vec<(u64, u64)>>,
     slow: &SlowIntern,
     threads: usize,
+    user_bins: usize,
 ) -> Aliases {
     let edge_count = parts.iter().map(Vec::len).sum::<usize>();
     if edge_count == 0 {
@@ -248,18 +249,14 @@ pub(super) fn build(
 
     let workers = threads.max(1).min(parts.len().max(1));
     let endpoint_count = edge_count.checked_mul(2).expect("too many link endpoints");
-    let useful_by_size = endpoint_count
-        .div_ceil(1 << 16)
+    // Shards share the top hash bits with the caller's user bins, so a job
+    // that owns one user bin probes only one cache-sized shard.
+    let shard_count = endpoint_count
+        .div_ceil(1 << 12)
         .max(1)
         .checked_next_power_of_two()
-        .unwrap_or(256)
-        .min(256);
-    let desired = workers
-        .checked_mul(4)
-        .and_then(usize::checked_next_power_of_two)
-        .unwrap_or(256)
-        .min(256);
-    let shard_count = desired.min(useful_by_size).max(1);
+        .unwrap_or(user_bins)
+        .min(user_bins.max(1));
     let shard_mask = shard_count - 1;
     let shard_bits = shard_count.trailing_zeros();
     let shard_shift = if shard_bits == 0 { 0 } else { 64 - shard_bits };
