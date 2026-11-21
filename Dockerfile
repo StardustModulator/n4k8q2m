@@ -7,4 +7,6 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/solve /solve
+# Fresh pages for gigabytes of records are cheaper as huge pages.
+ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 ENTRYPOINT ["/solve"]
