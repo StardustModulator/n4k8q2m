@@ -20,14 +20,40 @@
 /// the end of a final unterminated record. Empty fields are returned as empty
 /// slices, and syntactic quotes are removed from returned quoted fields.
 #[inline]
-pub(super) fn rows<'b, const N: usize>(buf: &'b [u8], mut f: impl FnMut([&'b [u8]; N])) {
+pub(super) fn rows<'b, const N: usize>(buf: &'b [u8], f: impl FnMut([&'b [u8]; N])) {
+    records::<N, _>(buf, f);
+}
+
+/// `rows` for a sink that can also take a record by its separator offsets.
+/// Returns the sink.
+#[inline]
+pub(super) fn records<'b, const N: usize, S: Sink<'b, N>>(buf: &'b [u8], mut s: S) -> S {
     const { assert!(2 <= N && N <= 8) };
-    rows_window::<N>(buf, WINDOW, &mut f);
+    rows_window::<N>(buf, WINDOW, &mut s);
+    s
+}
+
+/// Receives the well-formed records of `N` fields. The window scanner hands
+/// over a `Fields` whose offsets a decoder may read directly; the other paths
+/// always deliver sliced fields.
+pub(super) trait Sink<'b, const N: usize> {
+    #[inline(always)]
+    fn record(&mut self, f: Fields<'b, N>) {
+        self.fields(f.all());
+    }
+    fn fields(&mut self, f: [&'b [u8]; N]);
+}
+
+impl<'b, const N: usize, F: FnMut([&'b [u8]; N])> Sink<'b, N> for F {
+    #[inline(always)]
+    fn fields(&mut self, f: [&'b [u8]; N]) {
+        self(f);
+    }
 }
 
 /// A well-formed record of `N` fields, sliced by one rule for every path.
 /// Built only where its offsets are live.
-struct Fields<'b, const N: usize> {
+pub(super) struct Fields<'b, const N: usize> {
     base: *const u8,  // offsets count from here
     ends: *const u32, // the record's N separator offsets (the last: LF or EOF)
     first: *const u8, // the record's first byte
@@ -35,6 +61,25 @@ struct Fields<'b, const N: usize> {
 }
 
 impl<'b, const N: usize> Fields<'b, N> {
+    /// The record's first byte. Every byte before its last separator
+    /// (`end(N - 1)`) is readable; the separator itself is the LF, or EOF,
+    /// which may lie past the buffer.
+    #[inline(always)]
+    pub(super) fn first(&self) -> *const u8 {
+        self.first
+    }
+
+    /// Separator `i`'s offset from `first()`: the end of field `i`. The
+    /// separators increase; the last is the record's LF (or EOF). Quotes are
+    /// valid: a field is wrapped exactly when its first byte is a quote, and
+    /// then its last byte is one too.
+    #[inline(always)]
+    pub(super) fn end(&self, i: usize) -> u32 {
+        assert!(i < N);
+        // SAFETY: the N slots at `ends` belong to this record (see `get`).
+        unsafe { *self.ends.add(i) - self.first.offset_from(self.base) as u32 }
+    }
+
     /// Field `i` without its syntactic quotes.
     #[inline(always)]
     fn get(&self, i: usize) -> &'b [u8] {
@@ -59,7 +104,7 @@ impl<'b, const N: usize> Fields<'b, N> {
 
     /// Every field, as `rows` passes them.
     #[inline(always)]
-    fn all(&self) -> [&'b [u8]; N] {
+    pub(super) fn all(&self) -> [&'b [u8]; N] {
         let mut out: [&'b [u8]; N] = [&[]; N];
         for (i, o) in out.iter_mut().enumerate() {
             *o = self.get(i);
@@ -105,7 +150,7 @@ const NONE: u32 = u32::MAX;
 /// Every other record has valid quotes, so each field is quoted exactly when
 /// its first (or last) byte is a quote.
 #[inline]
-fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, f: &mut impl FnMut([&'b [u8]; N])) {
+fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, f: &mut impl Sink<'b, N>) {
     debug_assert!(window % 64 == 0 && window > 0 && window <= WINDOW);
     let len = buf.len();
     // Slack for the unconditional writes, the EOF entry and the sentinels.
@@ -128,17 +173,6 @@ fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, f: &mut impl Fn
             start = stop;
         }
     }
-}
-
-/// Ask for the line at `p` ahead of use: one hint per block for the block one
-/// window ahead. A hint never faults.
-#[inline(always)]
-fn prefetch(p: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a prefetch hint has no architectural effect.
-    unsafe { std::arch::x86_64::_mm_prefetch(p.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0) };
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = p;
 }
 
 /// 1 for a separator byte: one load instead of two compares per block.
@@ -273,7 +307,7 @@ fn window_rows<'b, const N: usize>(
     end: usize,
     sp: *mut u32,
     lp: *mut u32,
-    f: &mut impl FnMut([&'b [u8]; N]),
+    f: &mut impl Sink<'b, N>,
 ) -> usize {
     let len = buf.len();
     // A window starts at a record boundary.
@@ -290,9 +324,6 @@ fn window_rows<'b, const N: usize>(
         // the final block's start), so the block and the byte after it lie
         // inside `buf`. Capacity covers every slot (see rows_window).
         unsafe {
-            // Wrapping: in the last window the target lies past `buf`, which
-            // `add` forbids even for an address that is never dereferenced.
-            prefetch(p.wrapping_add(WINDOW));
             let m = masks64(p);
             let next_s = is_sep(*p.add(64));
             st.block::<N>(rel, m, next_s, 0);
@@ -344,7 +375,7 @@ fn window_rows<'b, const N: usize>(
         if unsafe { *kp.add(N - 1) } == line {
             // SAFETY: row <= len - start; the N slots at kp are this record's
             // separators, and stage 1 found its quotes valid.
-            f(Fields { base, ends: kp, first: unsafe { base.add(row) }, _buf: std::marker::PhantomData }.all());
+            f.record(Fields { base, ends: kp, first: unsafe { base.add(row) }, _buf: std::marker::PhantomData });
             // SAFETY: the N slots belong to this record.
             kp = unsafe { kp.add(N) };
         } else {
@@ -370,7 +401,7 @@ fn window_rows<'b, const N: usize>(
 /// byte's offset.
 #[cold]
 #[inline(never)]
-fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: *const u32, f: &mut impl FnMut([&'b [u8]; N])) {
+fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: *const u32, f: &mut impl Sink<'b, N>) {
     // SAFETY: stage 1 initialized the N slots.
     let rel = unsafe { std::slice::from_raw_parts(ends, N) };
     let mut s = start + row;
@@ -386,7 +417,7 @@ fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: *con
     }
     // SAFETY: start + row <= len.
     let base = unsafe { buf.as_ptr().add(start) };
-    f(Fields { base, ends, first: unsafe { base.add(row) }, _buf: std::marker::PhantomData }.all());
+    f.fields(Fields { base, ends, first: unsafe { base.add(row) }, _buf: std::marker::PhantomData }.all());
 }
 
 /// A block failed the quote check: poison its LFs, and return the poison for
@@ -403,7 +434,7 @@ fn poison_block(lp: *mut u32, lfs: usize) -> u32 {
 
 /// The single-stage scanner for `buf[from..to]`: no row-length limit.
 #[inline]
-fn rows_simple<'b, const N: usize>(buf: &'b [u8], from: usize, to: usize, f: &mut impl FnMut([&'b [u8]; N])) {
+fn rows_simple<'b, const N: usize>(buf: &'b [u8], from: usize, to: usize, f: &mut impl Sink<'b, N>) {
     debug_assert!((2..=8).contains(&N) && from <= to && to <= buf.len());
     if from == to {
         return;
@@ -454,7 +485,7 @@ impl<const N: usize> Rows<N> {
 
     #[inline(always)]
     fn block<'b>(&mut self, buf: &'b [u8], base: usize, mut c: u64, mut n: u64, q: u64,
-                 f: &mut impl FnMut([&'b [u8]; N])) {
+                 f: &mut impl Sink<'b, N>) {
         while n != 0 {
             let bit = n.trailing_zeros();
             let below = (1u64 << bit) - 1;
@@ -471,7 +502,7 @@ impl<const N: usize> Rows<N> {
 
     /// Close the record whose terminator (LF or the range end) is at `end`.
     #[inline(always)]
-    fn finish<'b>(&mut self, buf: &'b [u8], end: usize, rowq: u32, f: &mut impl FnMut([&'b [u8]; N])) {
+    fn finish<'b>(&mut self, buf: &'b [u8], end: usize, rowq: u32, f: &mut impl Sink<'b, N>) {
         if self.cnt == N - 1 {
             let last = buf.len() - 1;
             let mut wrapped = 0u32;
@@ -491,7 +522,7 @@ impl<const N: usize> Rows<N> {
             if wrapped == rowq {
                 // SAFETY: row_start <= len; `rel` outlives the call.
                 let first = unsafe { buf.as_ptr().add(self.row_start) };
-                f(Fields { base: first, ends: rel.as_ptr(), first, _buf: std::marker::PhantomData }.all());
+                f.fields(Fields { base: first, ends: rel.as_ptr(), first, _buf: std::marker::PhantomData }.all());
             }
         }
         self.cnt = 0;
